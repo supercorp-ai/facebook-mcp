@@ -56,15 +56,13 @@ const FACEBOOK_REDIRECT_URI: string = argv.facebookRedirectUri
 const FACEBOOK_STATE: string = argv.facebookState
 
 // Generate the Facebook OAuth URL.
-// Request minimal permissions plus those needed for pages:
-// - pages_show_list: to list Pages the user manages.
-// - pages_manage_posts: to post to a Page.
-// - pages_read_engagement: to read post insights or posts.
+// Now requesting these scopes:
+//   public_profile, pages_show_list, pages_manage_posts, pages_read_engagement, and read_insights.
 function generateFacebookAuthUrl(): string {
   const params = new URLSearchParams({
     client_id: FACEBOOK_APP_ID,
     redirect_uri: FACEBOOK_REDIRECT_URI,
-    scope: 'public_profile,pages_show_list,pages_manage_posts,pages_read_engagement',
+    scope: 'public_profile,pages_show_list,pages_manage_posts,pages_read_engagement,read_insights',
     ...FACEBOOK_STATE ? { state: FACEBOOK_STATE } : {}
   })
   return `https://www.facebook.com/v12.0/dialog/oauth?${params.toString()}`
@@ -174,6 +172,38 @@ async function readFacebookPagePosts({ pageId }: { pageId: string }): Promise<an
 }
 
 // --------------------------------------------------------------------
+// New Tool Function: Read Insights from a Facebook Page
+// --------------------------------------------------------------------
+// This function now supports optional since, until, and period parameters.
+// Example URL:
+// https://graph.facebook.com/{page-id}/insights?access_token={page-access-token}&metric=page_engaged_users,page_impressions&since=2022-07-01&until=2022-08-02&period=day,week
+async function readFacebookPageInsights({
+  pageId,
+  metric,
+  since,
+  until,
+  period
+}: { pageId: string; metric: string[]; since?: string; until?: string; period?: string[] }): Promise<any[]> {
+  if (!facebookPages[pageId]) throw new Error('Page not found or not authorized. Please list pages first.')
+  const pageAccessToken = facebookPages[pageId]
+  const params = new URLSearchParams({
+    metric: metric.join(','),
+    access_token: pageAccessToken
+  })
+  if (since) params.set("since", since)
+  if (until) params.set("until", until)
+  if (period) params.set("period", period.join(','))
+  const response = await fetch(`https://graph.facebook.com/${pageId}/insights?${params.toString()}`, {
+    method: 'GET'
+  })
+  const data = await response.json()
+  if (!response.ok || data.error) {
+    throw new Error(`Failed to fetch page insights: ${data.error ? data.error.message : 'Unknown error'}`)
+  }
+  return data.data
+}
+
+// --------------------------------------------------------------------
 // 5) Helper: JSON response formatter
 // --------------------------------------------------------------------
 function toTextJson(data: unknown): { content: Array<{ type: 'text'; text: string }> } {
@@ -199,7 +229,7 @@ function createMcpServer(): McpServer {
   // Tool: Return the Facebook OAuth URL.
   server.tool(
     'facebook_auth_url',
-    'Return an OAuth URL for Facebook login. Use this URL to grant access with public_profile, pages_show_list, pages_manage_posts, and pages_read_engagement scopes.',
+    'Return an OAuth URL for Facebook login. Use this URL to grant access with public_profile, pages_show_list, pages_manage_posts, pages_read_engagement, and read_insights scopes.',
     {},
     async () => {
       try {
@@ -272,6 +302,44 @@ function createMcpServer(): McpServer {
       try {
         const posts = await readFacebookPagePosts(args)
         return toTextJson({ posts })
+      } catch (err: any) {
+        return toTextJson({ error: String(err.message) })
+      }
+    }
+  )
+
+  // New Tool: Read insights from a specific Facebook Page.
+  // Allowed metric values:
+  //  "page_impressions", "page_impressions_unique", "page_engaged_users",
+  //  "page_fan_adds", "page_fan_removes", "page_actions_post_reactions_total",
+  //  "page_video_views", "page_posts_impressions", "page_posts_impressions_unique",
+  //  "page_views_total"
+  // Allowed period values: "day", "week", "days_28", "lifetime"
+  server.tool(
+    'facebook_read_page_insights',
+    'Read insights from a specified Facebook Page. Provide pageId, a list of metrics, and optionally since, until (ISO date strings), and a list of period values. Example URL: https://graph.facebook.com/{page-id}/insights?access_token={page-access-token}&metric=page_engaged_users,page_impressions&since=2022-07-01&until=2022-08-02&period=day,week',
+    {
+      pageId: z.string(),
+      metric: z.array(z.enum([
+        "page_impressions",
+        "page_impressions_unique",
+        "page_engaged_users",
+        "page_fan_adds",
+        "page_fan_removes",
+        "page_actions_post_reactions_total",
+        "page_video_views",
+        "page_posts_impressions",
+        "page_posts_impressions_unique",
+        "page_views_total"
+      ])),
+      since: z.string().optional(),
+      until: z.string().optional(),
+      period: z.array(z.enum(["day", "week", "days_28", "lifetime"])).optional()
+    },
+    async (args: { pageId: string; metric: string[]; since?: string; until?: string; period?: string[] }) => {
+      try {
+        const insights = await readFacebookPageInsights(args)
+        return toTextJson({ insights })
       } catch (err: any) {
         return toTextJson({ error: String(err.message) })
       }
