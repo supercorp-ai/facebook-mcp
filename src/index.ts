@@ -38,11 +38,9 @@ interface Storage {
 // --------------------------------------------------------------------
 class MemoryStorage implements Storage {
   private storage: Record<string, Record<string, any>> = {};
-
   async get(memoryKey: string) {
     return this.storage[memoryKey];
   }
-
   async set(memoryKey: string, data: Record<string, any>) {
     this.storage[memoryKey] = { ...this.storage[memoryKey], ...data };
   }
@@ -54,17 +52,14 @@ class MemoryStorage implements Storage {
 class RedisStorage implements Storage {
   private redis: Redis;
   private keyPrefix: string;
-
   constructor(redisUrl: string, redisToken: string, keyPrefix: string) {
     this.redis = new Redis({ url: redisUrl, token: redisToken });
     this.keyPrefix = keyPrefix;
   }
-
   async get(memoryKey: string): Promise<Record<string, any> | undefined> {
-    const data = await this.redis.get<Record<string, any>>(`${this.keyPrefix}:${memoryKey}`);
+    const data = await this.redis.get(`${this.keyPrefix}:${memoryKey}`);
     return data === null ? undefined : data;
   }
-
   async set(memoryKey: string, data: Record<string, any>) {
     const existing = (await this.get(memoryKey)) || {};
     const newData = { ...existing, ...data };
@@ -81,14 +76,18 @@ function generateFacebookAuthUrl(config: Config): string {
     redirect_uri: config.facebookRedirectUri,
     scope: 'public_profile,pages_show_list,pages_manage_posts,pages_read_engagement,read_insights'
   });
-  // Include state if provided.
   if (config.facebookState && config.facebookState.trim()) {
     params.set('state', config.facebookState.trim());
   }
   return `https://www.facebook.com/v12.0/dialog/oauth?${params.toString()}`;
 }
 
-async function exchangeFacebookAuthCode(code: string, config: Config, storage: Storage, memoryKey: string): Promise<string> {
+async function exchangeFacebookAuthCode(
+  code: string,
+  config: Config,
+  storage: Storage,
+  memoryKey: string
+): Promise<string> {
   const params = new URLSearchParams({
     client_id: config.facebookAppId,
     redirect_uri: config.facebookRedirectUri,
@@ -102,12 +101,15 @@ async function exchangeFacebookAuthCode(code: string, config: Config, storage: S
   if (!data.access_token) {
     throw new Error('Failed to obtain Facebook access token.');
   }
-  // Store access token in storage.
   await storage.set(memoryKey, { accessToken: data.access_token });
   return data.access_token;
 }
 
-async function fetchFacebookUser(config: Config, storage: Storage, memoryKey: string): Promise<{ id: string; name: string }> {
+async function fetchFacebookUser(
+  config: Config,
+  storage: Storage,
+  memoryKey: string
+): Promise<{ id: string; name: string }> {
   const stored = await storage.get(memoryKey);
   if (!stored || !stored.accessToken) {
     throw new Error('No Facebook access token available.');
@@ -123,7 +125,9 @@ async function fetchFacebookUser(config: Config, storage: Storage, memoryKey: st
   return data;
 }
 
-async function authFacebook(args: { code: string; config: Config; storage: Storage; memoryKey: string }): Promise<{ success: boolean; provider: string; user: { id: string; name: string } }> {
+async function authFacebook(
+  args: { code: string; config: Config; storage: Storage; memoryKey: string }
+): Promise<{ success: boolean; provider: string; user: { id: string; name: string } }> {
   const { code, config, storage, memoryKey } = args;
   await exchangeFacebookAuthCode(code, config, storage, memoryKey);
   const user = await fetchFacebookUser(config, storage, memoryKey);
@@ -137,10 +141,13 @@ interface FacebookPage {
   id: string;
   name: string;
   access_token: string;
-  // Other fields if needed.
 }
 
-async function listFacebookPages(config: Config, storage: Storage, memoryKey: string): Promise<FacebookPage[]> {
+async function listFacebookPages(
+  config: Config,
+  storage: Storage,
+  memoryKey: string
+): Promise<FacebookPage[]> {
   const stored = await storage.get(memoryKey);
   if (!stored || !stored.accessToken) {
     throw new Error('No Facebook access token available.');
@@ -152,8 +159,6 @@ async function listFacebookPages(config: Config, storage: Storage, memoryKey: st
   if (!response.ok || data.error) {
     throw new Error(`Failed to fetch pages: ${data.error ? data.error.message : 'Unknown error'}`);
   }
-  // Cache pages in storage under "pages"
-  // Create a mapping: pageId -> pageAccessToken
   const pages: { [key: string]: string } = {};
   for (const page of data.data) {
     pages[page.id] = page.access_token;
@@ -162,24 +167,44 @@ async function listFacebookPages(config: Config, storage: Storage, memoryKey: st
   return data.data;
 }
 
-async function createFacebookPagePost(args: { pageId: string; postContent: string; config: Config; storage: Storage; memoryKey: string }): Promise<{ success: boolean; message: string; postId: string }> {
-  const { pageId, postContent, config, storage, memoryKey } = args;
+/**
+ * Create a new post on a Facebook Page.
+ * If an optional imageUrl is provided, post to /photos endpoint; otherwise post to /feed.
+ */
+async function createFacebookPagePost(
+  args: { pageId: string; postContent: string; imageUrl?: string; config: Config; storage: Storage; memoryKey: string }
+): Promise<{ success: boolean; message: string; postId: string }> {
+  const { pageId, postContent, imageUrl, config, storage, memoryKey } = args;
   const stored = await storage.get(memoryKey);
   const pages = stored?.pages;
   if (!pages || !pages[pageId]) {
     throw new Error('Page not found or not authorized. Please list pages first.');
   }
   const pageAccessToken = pages[pageId];
-  const postData = new URLSearchParams({
-    message: postContent,
-    access_token: pageAccessToken
-  });
-  const response = await fetch(`https://graph.facebook.com/${pageId}/feed`, {
+  let url: string;
+  let params: URLSearchParams;
+
+  if (imageUrl && imageUrl.trim()) {
+    // Post an image: use the /photos endpoint.
+    url = `https://graph.facebook.com/${pageId}/photos`;
+    params = new URLSearchParams({
+      url: imageUrl,
+      caption: postContent,
+      access_token: pageAccessToken
+    });
+  } else {
+    // Regular text post: use the /feed endpoint.
+    url = `https://graph.facebook.com/${pageId}/feed`;
+    params = new URLSearchParams({
+      message: postContent,
+      access_token: pageAccessToken
+    });
+  }
+
+  const response = await fetch(url, {
     method: 'POST',
-    headers: {
-      'Content-Type': 'application/x-www-form-urlencoded'
-    },
-    body: postData.toString()
+    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+    body: params.toString()
   });
   const data = await response.json();
   if (!response.ok || data.error) {
@@ -188,7 +213,9 @@ async function createFacebookPagePost(args: { pageId: string; postContent: strin
   return { success: true, message: 'Post created successfully.', postId: data.id };
 }
 
-async function readFacebookPagePosts(args: { pageId: string; config: Config; storage: Storage; memoryKey: string }): Promise<any[]> {
+async function readFacebookPagePosts(
+  args: { pageId: string; config: Config; storage: Storage; memoryKey: string }
+): Promise<any[]> {
   const { pageId, config, storage, memoryKey } = args;
   const stored = await storage.get(memoryKey);
   const pages = stored?.pages;
@@ -206,7 +233,9 @@ async function readFacebookPagePosts(args: { pageId: string; config: Config; sto
   return data.data;
 }
 
-async function readFacebookPageInsights(args: { pageId: string; metric: string[]; since?: string; until?: string; period?: string[]; config: Config; storage: Storage; memoryKey: string }): Promise<any[]> {
+async function readFacebookPageInsights(
+  args: { pageId: string; metric: string[]; since?: string; until?: string; period?: string[]; config: Config; storage: Storage; memoryKey: string }
+): Promise<any[]> {
   const { pageId, metric, since, until, period, config, storage, memoryKey } = args;
   const stored = await storage.get(memoryKey);
   const pages = stored?.pages;
@@ -232,30 +261,27 @@ async function readFacebookPageInsights(args: { pageId: string; metric: string[]
 }
 
 // --------------------------------------------------------------------
-// Helper: JSON Response Formatter
+// Helper: JSON Response Formatter (repeated)
 // --------------------------------------------------------------------
 function toTextJson(data: unknown): { content: Array<{ type: 'text'; text: string }> } {
   return {
     content: [
-      {
-        type: 'text',
-        text: JSON.stringify(data, null, 2)
-      }
+      { type: 'text', text: JSON.stringify(data, null, 2) }
     ]
   };
 }
 
 // --------------------------------------------------------------------
-// Create an MCP server and register Facebook tools
+// Create an MCP server and register Facebook tools with toolsPrefix support
 // --------------------------------------------------------------------
-function createMcpServer(memoryKey: string, config: Config): McpServer {
+function createMcpServer(memoryKey: string, config: Config, toolsPrefix: string): McpServer {
   const server = new McpServer({
     name: `Facebook MCP Server (Memory Key: ${memoryKey})`,
     version: '1.0.0'
   });
 
   server.tool(
-    'facebook_auth_url',
+    `${toolsPrefix}auth_url`,
     'Return an OAuth URL for Facebook login. Use this URL to grant access with public_profile, pages_show_list, pages_manage_posts, pages_read_engagement, and read_insights scopes.',
     {},
     async () => {
@@ -269,7 +295,7 @@ function createMcpServer(memoryKey: string, config: Config): McpServer {
   );
 
   server.tool(
-    'facebook_exchange_auth_code',
+    `${toolsPrefix}exchange_auth_code`,
     'Authenticate with Facebook by exchanging an auth code. This sets up Facebook authentication.',
     { code: z.string() },
     async (args: { code: string }) => {
@@ -283,7 +309,7 @@ function createMcpServer(memoryKey: string, config: Config): McpServer {
   );
 
   server.tool(
-    'facebook_list_pages',
+    `${toolsPrefix}list_pages`,
     'List all Pages managed by the authenticated user. Returns each page with its id and name. (Also caches page tokens for subsequent calls.)',
     {},
     async () => {
@@ -297,12 +323,12 @@ function createMcpServer(memoryKey: string, config: Config): McpServer {
   );
 
   server.tool(
-    'facebook_create_page_post',
-    'Create a new post on a specified Facebook Page. Provide pageId and postContent as text.',
-    { pageId: z.string(), postContent: z.string() },
-    async (args: { pageId: string; postContent: string }) => {
+    `${toolsPrefix}create_page_post`,
+    'Create a new post on a specified Facebook Page. Provide pageId and postContent as text. Optionally, provide imageUrl to post an image.',
+    { pageId: z.string(), postContent: z.string(), imageUrl: z.string().optional() },
+    async (args: { pageId: string; postContent: string; imageUrl?: string }) => {
       try {
-        const result = await createFacebookPagePost({ pageId: args.pageId, postContent: args.postContent, config, storage: getStorage(config), memoryKey });
+        const result = await createFacebookPagePost({ pageId: args.pageId, postContent: args.postContent, imageUrl: args.imageUrl, config, storage: getStorage(config), memoryKey });
         return toTextJson(result);
       } catch (err: any) {
         return toTextJson({ error: String(err.message) });
@@ -311,7 +337,7 @@ function createMcpServer(memoryKey: string, config: Config): McpServer {
   );
 
   server.tool(
-    'facebook_read_page_posts',
+    `${toolsPrefix}read_page_posts`,
     'Read posts from a specified Facebook Page. Provide pageId.',
     { pageId: z.string() },
     async (args: { pageId: string }) => {
@@ -325,7 +351,7 @@ function createMcpServer(memoryKey: string, config: Config): McpServer {
   );
 
   server.tool(
-    'facebook_read_page_insights',
+    `${toolsPrefix}read_page_insights`,
     'Read insights from a specified Facebook Page. Provide pageId, a list of metrics, and optionally since, until (ISO date strings), and a list of period values.',
     {
       pageId: z.string(),
@@ -360,9 +386,9 @@ function getStorage(config: Config): Storage {
 }
 
 // --------------------------------------------------------------------
-// Main: Start the server (SSE or stdio)
+// Main: Start the server (SSE or stdio) with CLI validations
 // --------------------------------------------------------------------
-function main(): void {
+async function main() {
   const argv = yargs(hideBin(process.argv))
     .option('port', { type: 'number', default: 8000 })
     .option('transport', { type: 'string', choices: ['sse', 'stdio'], default: 'sse' })
@@ -377,6 +403,7 @@ function main(): void {
     .option('facebookAppSecret', { type: 'string', demandOption: true, describe: "Facebook App Secret" })
     .option('facebookRedirectUri', { type: 'string', demandOption: true, describe: "Facebook Redirect URI" })
     .option('facebookState', { type: 'string', describe: "Optional OAuth state parameter" })
+    .option('toolsPrefix', { type: 'string', default: 'facebook_', describe: 'Prefix to add to all tool names.' })
     .option('storageHeaderKey', { type: 'string', describe: 'For storage "memory" or "upstash-redis-rest": the header name (or key prefix) to use.' })
     .option('upstashRedisRestUrl', { type: 'string', describe: 'Upstash Redis REST URL (if --storage=upstash-redis-rest)' })
     .option('upstashRedisRestToken', { type: 'string', describe: 'Upstash Redis REST token (if --storage=upstash-redis-rest)' })
@@ -412,9 +439,11 @@ function main(): void {
     }
   }
 
+  const toolsPrefix: string = argv.toolsPrefix;
+
   if (config.transport === 'stdio') {
     const memoryKey = "single";
-    const server = createMcpServer(memoryKey, config);
+    const server = createMcpServer(memoryKey, config, toolsPrefix);
     const transport = new StdioServerTransport();
     void server.connect(transport);
     console.log('Listening on stdio');
@@ -430,7 +459,6 @@ function main(): void {
   }
   let sessions: ServerSession[] = [];
 
-  // Use JSON parser for non-/message routes.
   app.use((req, res, next) => {
     if (req.path === '/message') return next();
     express.json()(req, res, next);
@@ -438,17 +466,17 @@ function main(): void {
 
   app.get('/', async (req: Request, res: ExpressResponse) => {
     let memoryKey: string;
-    if (config.storage === 'memory-single') {
+    if ((argv.storage as string) === 'memory-single') {
       memoryKey = "single";
     } else {
-      const headerVal = req.headers[config.storageHeaderKey!.toLowerCase()];
+      const headerVal = req.headers[(argv.storageHeaderKey as string).toLowerCase()];
       if (typeof headerVal !== 'string' || !headerVal.trim()) {
-        res.status(400).json({ error: `Missing or invalid "${config.storageHeaderKey}" header` });
+        res.status(400).json({ error: `Missing or invalid "${argv.storageHeaderKey}" header` });
         return;
       }
       memoryKey = headerVal.trim();
     }
-    const server = createMcpServer(memoryKey, config);
+    const server = createMcpServer(memoryKey, config, toolsPrefix);
     const transport = new SSEServerTransport('/message', res);
     await server.connect(transport);
     const sessionId = transport.sessionId;
@@ -489,9 +517,12 @@ function main(): void {
     }
   });
 
-  app.listen(config.port, () => {
-    console.log(`Listening on port ${config.port} (${argv.transport})`);
+  app.listen(argv.port, () => {
+    console.log(`Listening on port ${argv.port} (${argv.transport})`);
   });
 }
 
-main();
+main().catch((err: any) => {
+  console.error('Fatal error:', err);
+  process.exit(1);
+});
