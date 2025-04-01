@@ -1,210 +1,238 @@
 #!/usr/bin/env node
 
-import yargs from 'yargs'
 import { hideBin } from 'yargs/helpers'
-import express, { Request, Response } from 'express'
+import yargs from 'yargs'
+import express, { Request, Response as ExpressResponse } from 'express'
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js'
 import { SSEServerTransport } from '@modelcontextprotocol/sdk/server/sse.js'
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js'
 import { z } from 'zod'
+import { Redis } from '@upstash/redis'
 
-// Define interfaces for Facebook user and page responses
-interface FacebookUser {
-  id: string
-  name: string
-  // Add other fields if needed
+// --------------------------------------------------------------------
+// Configuration & Storage Interface
+// --------------------------------------------------------------------
+interface Config {
+  port: number;
+  transport: 'sse' | 'stdio';
+  // Storage modes: "memory-single", "memory", or "upstash-redis-rest"
+  storage: 'memory-single' | 'memory' | 'upstash-redis-rest';
+  facebookAppId: string;
+  facebookAppSecret: string;
+  facebookRedirectUri: string;
+  facebookState?: string;
+  // For storage "memory" and "upstash-redis-rest": the header name (or key prefix) to use.
+  storageHeaderKey?: string;
+  // Upstash-specific options (if storage is "upstash-redis-rest")
+  upstashRedisRestUrl?: string;
+  upstashRedisRestToken?: string;
 }
 
-interface FacebookPage {
-  id: string
-  name: string
-  access_token: string
-  // Add other fields if needed
+interface Storage {
+  get(memoryKey: string): Promise<Record<string, any> | undefined>;
+  set(memoryKey: string, data: Record<string, any>): Promise<void>;
 }
 
 // --------------------------------------------------------------------
-// 1) Parse CLI options (including Facebook credentials and state)
+// In-Memory Storage Implementation
 // --------------------------------------------------------------------
-const argv = yargs(hideBin(process.argv))
-  .option('port', { type: 'number', default: 8000 })
-  .option('transport', { type: 'string', choices: ['sse', 'stdio'], default: 'sse' })
-  .option('facebookAppId', { type: 'string', demandOption: true, describe: "Facebook App ID" })
-  .option('facebookAppSecret', { type: 'string', demandOption: true, describe: "Facebook App Secret" })
-  .option('facebookRedirectUri', { type: 'string', demandOption: true, describe: "Facebook Redirect URI" })
-  .option('facebookState', { type: 'string', default: '', describe: "OAuth state parameter" })
-  .help()
-  .parseSync()
+class MemoryStorage implements Storage {
+  private storage: Record<string, Record<string, any>> = {};
 
-// Define log functions with explicit types
-const log = (...args: any[]): void => console.log('[facebook-mcp]', ...args)
-const logErr = (...args: any[]): void => console.error('[facebook-mcp]', ...args)
+  async get(memoryKey: string) {
+    return this.storage[memoryKey];
+  }
+
+  async set(memoryKey: string, data: Record<string, any>) {
+    this.storage[memoryKey] = { ...this.storage[memoryKey], ...data };
+  }
+}
 
 // --------------------------------------------------------------------
-// 2) Global Facebook Auth State
+// Upstash Redis Storage Implementation
 // --------------------------------------------------------------------
-let facebookAccessToken: string | null = null
-let facebookUserId: string | null = null
-// This will store a mapping of pageId -> pageAccessToken (and optionally page info)
-const facebookPages: { [key: string]: string } = {}
+class RedisStorage implements Storage {
+  private redis: Redis;
+  private keyPrefix: string;
+
+  constructor(redisUrl: string, redisToken: string, keyPrefix: string) {
+    this.redis = new Redis({ url: redisUrl, token: redisToken });
+    this.keyPrefix = keyPrefix;
+  }
+
+  async get(memoryKey: string): Promise<Record<string, any> | undefined> {
+    const data = await this.redis.get<Record<string, any>>(`${this.keyPrefix}:${memoryKey}`);
+    return data === null ? undefined : data;
+  }
+
+  async set(memoryKey: string, data: Record<string, any>) {
+    const existing = (await this.get(memoryKey)) || {};
+    const newData = { ...existing, ...data };
+    await this.redis.set(`${this.keyPrefix}:${memoryKey}`, JSON.stringify(newData));
+  }
+}
 
 // --------------------------------------------------------------------
-// 3) Facebook OAuth Setup
+// Facebook OAuth Helper Functions
 // --------------------------------------------------------------------
-const FACEBOOK_APP_ID: string = argv.facebookAppId
-const FACEBOOK_APP_SECRET: string = argv.facebookAppSecret
-const FACEBOOK_REDIRECT_URI: string = argv.facebookRedirectUri
-const FACEBOOK_STATE: string = argv.facebookState
-
-// Generate the Facebook OAuth URL.
-// Now requesting these scopes:
-//   public_profile, pages_show_list, pages_manage_posts, pages_read_engagement, and read_insights.
-function generateFacebookAuthUrl(): string {
+function generateFacebookAuthUrl(config: Config): string {
   const params = new URLSearchParams({
-    client_id: FACEBOOK_APP_ID,
-    redirect_uri: FACEBOOK_REDIRECT_URI,
-    scope: 'public_profile,pages_show_list,pages_manage_posts,pages_read_engagement,read_insights',
-    ...FACEBOOK_STATE ? { state: FACEBOOK_STATE } : {}
-  })
-  return `https://www.facebook.com/v12.0/dialog/oauth?${params.toString()}`
+    client_id: config.facebookAppId,
+    redirect_uri: config.facebookRedirectUri,
+    scope: 'public_profile,pages_show_list,pages_manage_posts,pages_read_engagement,read_insights'
+  });
+  // Include state if provided.
+  if (config.facebookState && config.facebookState.trim()) {
+    params.set('state', config.facebookState.trim());
+  }
+  return `https://www.facebook.com/v12.0/dialog/oauth?${params.toString()}`;
 }
 
-// Exchange authorization code for a user access token.
-async function exchangeFacebookAuthCode(code: string): Promise<string> {
+async function exchangeFacebookAuthCode(code: string, config: Config, storage: Storage, memoryKey: string): Promise<string> {
   const params = new URLSearchParams({
-    client_id: FACEBOOK_APP_ID,
-    redirect_uri: FACEBOOK_REDIRECT_URI,
-    client_secret: FACEBOOK_APP_SECRET,
+    client_id: config.facebookAppId,
+    redirect_uri: config.facebookRedirectUri,
+    client_secret: config.facebookAppSecret,
     code: code.trim()
-  })
+  });
   const response = await fetch(`https://graph.facebook.com/v12.0/oauth/access_token?${params.toString()}`, {
     method: 'GET'
-  })
-  const data = await response.json()
+  });
+  const data = await response.json();
   if (!data.access_token) {
-    throw new Error('Failed to obtain Facebook access token.')
+    throw new Error('Failed to obtain Facebook access token.');
   }
-  facebookAccessToken = data.access_token
-  return data.access_token
+  // Store access token in storage.
+  await storage.set(memoryKey, { accessToken: data.access_token });
+  return data.access_token;
 }
 
-// Fetch the authenticated user's basic profile (including the user ID).
-async function fetchFacebookUser(): Promise<FacebookUser> {
-  if (!facebookAccessToken) throw new Error('No Facebook access token available.')
-  const response = await fetch(`https://graph.facebook.com/me?fields=id,name&access_token=${facebookAccessToken}`, {
+async function fetchFacebookUser(config: Config, storage: Storage, memoryKey: string): Promise<{ id: string; name: string }> {
+  const stored = await storage.get(memoryKey);
+  if (!stored || !stored.accessToken) {
+    throw new Error('No Facebook access token available.');
+  }
+  const response = await fetch(`https://graph.facebook.com/me?fields=id,name&access_token=${stored.accessToken}`, {
     method: 'GET'
-  })
-  const data = await response.json()
-  if (!data.id) throw new Error('Failed to fetch Facebook user id.')
-  facebookUserId = data.id
-  return data
+  });
+  const data = await response.json();
+  if (!data.id) {
+    throw new Error('Failed to fetch Facebook user id.');
+  }
+  await storage.set(memoryKey, { userId: data.id });
+  return data;
 }
 
-// Authenticate with Facebook: exchange the code and fetch user info.
-async function authFacebook({ code }: { code: string }): Promise<{ success: boolean; provider: string; user: FacebookUser }> {
-  await exchangeFacebookAuthCode(code)
-  const user = await fetchFacebookUser()
-  return { success: true, provider: "facebook", user }
+async function authFacebook(args: { code: string; config: Config; storage: Storage; memoryKey: string }): Promise<{ success: boolean; provider: string; user: { id: string; name: string } }> {
+  const { code, config, storage, memoryKey } = args;
+  await exchangeFacebookAuthCode(code, config, storage, memoryKey);
+  const user = await fetchFacebookUser(config, storage, memoryKey);
+  return { success: true, provider: "facebook", user };
 }
 
 // --------------------------------------------------------------------
-// 4) Tool Functions: Facebook Page Operations
+// Facebook Page Operations
 // --------------------------------------------------------------------
+interface FacebookPage {
+  id: string;
+  name: string;
+  access_token: string;
+  // Other fields if needed.
+}
 
-// List all pages managed by the authenticated user.
-// This calls the /me/accounts endpoint, which returns each page along with its access token.
-async function listFacebookPages(): Promise<FacebookPage[]> {
-  if (!facebookAccessToken) throw new Error('No Facebook access token available.')
-  const response = await fetch(`https://graph.facebook.com/me/accounts?access_token=${facebookAccessToken}`, {
+async function listFacebookPages(config: Config, storage: Storage, memoryKey: string): Promise<FacebookPage[]> {
+  const stored = await storage.get(memoryKey);
+  if (!stored || !stored.accessToken) {
+    throw new Error('No Facebook access token available.');
+  }
+  const response = await fetch(`https://graph.facebook.com/me/accounts?access_token=${stored.accessToken}`, {
     method: 'GET'
-  })
-  const data = await response.json()
+  });
+  const data = await response.json();
   if (!response.ok || data.error) {
-    throw new Error(`Failed to fetch pages: ${data.error ? data.error.message : 'Unknown error'}`)
+    throw new Error(`Failed to fetch pages: ${data.error ? data.error.message : 'Unknown error'}`);
   }
-  // Cache page access tokens for later use.
-  data.data.forEach((page: FacebookPage) => {
-    facebookPages[page.id] = page.access_token
-  })
-  return data.data
+  // Cache pages in storage under "pages"
+  // Create a mapping: pageId -> pageAccessToken
+  const pages: { [key: string]: string } = {};
+  for (const page of data.data) {
+    pages[page.id] = page.access_token;
+  }
+  await storage.set(memoryKey, { pages });
+  return data.data;
 }
 
-// Create a post on a specific page.
-// Requires the caller to provide the pageId (one of the pages returned from listFacebookPages)
-// and the postContent.
-async function createFacebookPagePost({ pageId, postContent }: { pageId: string; postContent: string }): Promise<{ success: boolean; message: string; postId: string }> {
-  if (!facebookPages[pageId]) {
-    throw new Error('Page not found or not authorized. Please list pages first.')
+async function createFacebookPagePost(args: { pageId: string; postContent: string; config: Config; storage: Storage; memoryKey: string }): Promise<{ success: boolean; message: string; postId: string }> {
+  const { pageId, postContent, config, storage, memoryKey } = args;
+  const stored = await storage.get(memoryKey);
+  const pages = stored?.pages;
+  if (!pages || !pages[pageId]) {
+    throw new Error('Page not found or not authorized. Please list pages first.');
   }
-  const pageAccessToken = facebookPages[pageId]
+  const pageAccessToken = pages[pageId];
   const postData = new URLSearchParams({
     message: postContent,
     access_token: pageAccessToken
-  })
+  });
   const response = await fetch(`https://graph.facebook.com/${pageId}/feed`, {
     method: 'POST',
     headers: {
       'Content-Type': 'application/x-www-form-urlencoded'
     },
     body: postData.toString()
-  })
-  const data = await response.json()
+  });
+  const data = await response.json();
   if (!response.ok || data.error) {
-    throw new Error(`Facebook page post creation failed: ${data.error ? data.error.message : 'Unknown error'}`)
+    throw new Error(`Facebook page post creation failed: ${data.error ? data.error.message : 'Unknown error'}`);
   }
-  return { success: true, message: 'Post created successfully.', postId: data.id }
+  return { success: true, message: 'Post created successfully.', postId: data.id };
 }
 
-// Read posts from a specific page.
-// Requires the pageId and uses the stored page access token.
-async function readFacebookPagePosts({ pageId }: { pageId: string }): Promise<any[]> {
-  if (!facebookPages[pageId]) {
-    throw new Error('Page not found or not authorized. Please list pages first.')
+async function readFacebookPagePosts(args: { pageId: string; config: Config; storage: Storage; memoryKey: string }): Promise<any[]> {
+  const { pageId, config, storage, memoryKey } = args;
+  const stored = await storage.get(memoryKey);
+  const pages = stored?.pages;
+  if (!pages || !pages[pageId]) {
+    throw new Error('Page not found or not authorized. Please list pages first.');
   }
-  const pageAccessToken = facebookPages[pageId]
+  const pageAccessToken = pages[pageId];
   const response = await fetch(`https://graph.facebook.com/${pageId}/posts?access_token=${pageAccessToken}`, {
     method: 'GET'
-  })
-  const data = await response.json()
+  });
+  const data = await response.json();
   if (!response.ok || data.error) {
-    throw new Error(`Failed to fetch page posts: ${data.error ? data.error.message : 'Unknown error'}`)
+    throw new Error(`Failed to fetch page posts: ${data.error ? data.error.message : 'Unknown error'}`);
   }
-  return data.data
+  return data.data;
 }
 
-// --------------------------------------------------------------------
-// New Tool Function: Read Insights from a Facebook Page
-// --------------------------------------------------------------------
-// This function now supports optional since, until, and period parameters.
-// Example URL:
-// https://graph.facebook.com/{page-id}/insights?access_token={page-access-token}&metric=page_engaged_users,page_impressions&since=2022-07-01&until=2022-08-02&period=day,week
-async function readFacebookPageInsights({
-  pageId,
-  metric,
-  since,
-  until,
-  period
-}: { pageId: string; metric: string[]; since?: string; until?: string; period?: string[] }): Promise<any[]> {
-  if (!facebookPages[pageId]) throw new Error('Page not found or not authorized. Please list pages first.')
-  const pageAccessToken = facebookPages[pageId]
+async function readFacebookPageInsights(args: { pageId: string; metric: string[]; since?: string; until?: string; period?: string[]; config: Config; storage: Storage; memoryKey: string }): Promise<any[]> {
+  const { pageId, metric, since, until, period, config, storage, memoryKey } = args;
+  const stored = await storage.get(memoryKey);
+  const pages = stored?.pages;
+  if (!pages || !pages[pageId]) {
+    throw new Error('Page not found or not authorized. Please list pages first.');
+  }
+  const pageAccessToken = pages[pageId];
   const params = new URLSearchParams({
     metric: metric.join(','),
     access_token: pageAccessToken
-  })
-  if (since) params.set("since", since)
-  if (until) params.set("until", until)
-  if (period) params.set("period", period.join(','))
+  });
+  if (since) params.set("since", since);
+  if (until) params.set("until", until);
+  if (period) params.set("period", period.join(','));
   const response = await fetch(`https://graph.facebook.com/${pageId}/insights?${params.toString()}`, {
     method: 'GET'
-  })
-  const data = await response.json()
+  });
+  const data = await response.json();
   if (!response.ok || data.error) {
-    throw new Error(`Failed to fetch page insights: ${data.error ? data.error.message : 'Unknown error'}`)
+    throw new Error(`Failed to fetch page insights: ${data.error ? data.error.message : 'Unknown error'}`);
   }
-  return data.data
+  return data.data;
 }
 
 // --------------------------------------------------------------------
-// 5) Helper: JSON response formatter
+// Helper: JSON Response Formatter
 // --------------------------------------------------------------------
 function toTextJson(data: unknown): { content: Array<{ type: 'text'; text: string }> } {
   return {
@@ -214,245 +242,256 @@ function toTextJson(data: unknown): { content: Array<{ type: 'text'; text: strin
         text: JSON.stringify(data, null, 2)
       }
     ]
-  }
+  };
 }
 
 // --------------------------------------------------------------------
-// 6) Create the MCP server, registering our tools
+// Create an MCP server and register Facebook tools
 // --------------------------------------------------------------------
-function createMcpServer(): McpServer {
+function createMcpServer(memoryKey: string, config: Config): McpServer {
   const server = new McpServer({
-    name: 'Facebook MCP Server',
+    name: `Facebook MCP Server (Memory Key: ${memoryKey})`,
     version: '1.0.0'
-  })
+  });
 
-  // Tool: Return the Facebook OAuth URL.
   server.tool(
     'facebook_auth_url',
     'Return an OAuth URL for Facebook login. Use this URL to grant access with public_profile, pages_show_list, pages_manage_posts, pages_read_engagement, and read_insights scopes.',
     {},
     async () => {
       try {
-        const authUrl = generateFacebookAuthUrl()
-        return toTextJson({ authUrl })
+        const authUrl = generateFacebookAuthUrl(config);
+        return toTextJson({ authUrl });
       } catch (err: any) {
-        return toTextJson({ error: String(err.message) })
+        return toTextJson({ error: String(err.message) });
       }
     }
-  )
+  );
 
-  // Tool: Exchange auth code for access token and fetch user info.
   server.tool(
     'facebook_exchange_auth_code',
     'Authenticate with Facebook by exchanging an auth code. This sets up Facebook authentication.',
-    {
-      code: z.string()
-    },
+    { code: z.string() },
     async (args: { code: string }) => {
       try {
-        const result = await authFacebook(args)
-        return toTextJson(result)
+        const result = await authFacebook({ code: args.code, config, storage: getStorage(config), memoryKey });
+        return toTextJson(result);
       } catch (err: any) {
-        return toTextJson({ error: String(err.message) })
+        return toTextJson({ error: String(err.message) });
       }
     }
-  )
+  );
 
-  // Tool: List pages the user manages.
   server.tool(
     'facebook_list_pages',
-    'List all Pages managed by the authenticated user. Returns each page with its id and name. (Also caches the page tokens for subsequent calls.)',
+    'List all Pages managed by the authenticated user. Returns each page with its id and name. (Also caches page tokens for subsequent calls.)',
     {},
     async () => {
       try {
-        const pages = await listFacebookPages()
-        return toTextJson({ pages })
+        const pages = await listFacebookPages(config, getStorage(config), memoryKey);
+        return toTextJson({ pages });
       } catch (err: any) {
-        return toTextJson({ error: String(err.message) })
+        return toTextJson({ error: String(err.message) });
       }
     }
-  )
+  );
 
-  // Tool: Create a new post on a specific Page.
   server.tool(
     'facebook_create_page_post',
     'Create a new post on a specified Facebook Page. Provide pageId and postContent as text.',
-    {
-      pageId: z.string(),
-      postContent: z.string()
-    },
+    { pageId: z.string(), postContent: z.string() },
     async (args: { pageId: string; postContent: string }) => {
       try {
-        const result = await createFacebookPagePost(args)
-        return toTextJson(result)
+        const result = await createFacebookPagePost({ pageId: args.pageId, postContent: args.postContent, config, storage: getStorage(config), memoryKey });
+        return toTextJson(result);
       } catch (err: any) {
-        return toTextJson({ error: String(err.message) })
+        return toTextJson({ error: String(err.message) });
       }
     }
-  )
+  );
 
-  // Tool: Read posts from a specific Page.
   server.tool(
     'facebook_read_page_posts',
     'Read posts from a specified Facebook Page. Provide pageId.',
-    {
-      pageId: z.string()
-    },
+    { pageId: z.string() },
     async (args: { pageId: string }) => {
       try {
-        const posts = await readFacebookPagePosts(args)
-        return toTextJson({ posts })
+        const posts = await readFacebookPagePosts({ pageId: args.pageId, config, storage: getStorage(config), memoryKey });
+        return toTextJson({ posts });
       } catch (err: any) {
-        return toTextJson({ error: String(err.message) })
+        return toTextJson({ error: String(err.message) });
       }
     }
-  )
+  );
 
-  // New Tool: Read insights from a specific Facebook Page.
-  // Allowed metric values:
-  //  "page_impressions", "page_impressions_unique", "page_engaged_users",
-  //  "page_fan_adds", "page_fan_removes", "page_actions_post_reactions_total",
-  //  "page_video_views", "page_posts_impressions", "page_posts_impressions_unique",
-  //  "page_views_total"
-  // Allowed period values: "day", "week", "days_28", "lifetime"
   server.tool(
     'facebook_read_page_insights',
-    'Read insights from a specified Facebook Page. Provide pageId, a list of metrics, and optionally since, until (ISO date strings), and a list of period values. Example URL: https://graph.facebook.com/{page-id}/insights?access_token={page-access-token}&metric=page_engaged_users,page_impressions&since=2022-07-01&until=2022-08-02&period=day,week',
+    'Read insights from a specified Facebook Page. Provide pageId, a list of metrics, and optionally since, until (ISO date strings), and a list of period values.',
     {
       pageId: z.string(),
-      metric: z.array(z.enum([
-        "page_impressions",
-        "page_impressions_unique",
-        "page_engaged_users",
-        "page_fan_adds",
-        "page_fan_removes",
-        "page_actions_post_reactions_total",
-        "page_video_views",
-        "page_posts_impressions",
-        "page_posts_impressions_unique",
-        "page_views_total"
-      ])),
+      metric: z.array(z.string()),
       since: z.string().optional(),
       until: z.string().optional(),
-      period: z.array(z.enum(["day", "week", "days_28", "lifetime"])).optional()
+      period: z.array(z.string()).optional()
     },
     async (args: { pageId: string; metric: string[]; since?: string; until?: string; period?: string[] }) => {
       try {
-        const insights = await readFacebookPageInsights(args)
-        return toTextJson({ insights })
+        const insights = await readFacebookPageInsights({ ...args, config, storage: getStorage(config), memoryKey });
+        return toTextJson({ insights });
       } catch (err: any) {
-        return toTextJson({ error: String(err.message) })
+        return toTextJson({ error: String(err.message) });
       }
     }
-  )
+  );
 
-  return server
+  return server;
 }
 
-// --------------------------------------------------------------------
-// 7) Minimal Fly.io "replay" handling (optional)
-// --------------------------------------------------------------------
-function parseFlyReplaySrc(headerValue: string): { [key: string]: string } {
-  const regex = /(.*?)=(.*?)($|;)/g
-  const matches = headerValue.matchAll(regex)
-  const result: { [key: string]: string } = {}
-  for (const match of matches) {
-    if (match.length >= 3) {
-      const key = match[1].trim()
-      const value = match[2].trim()
-      result[key] = value
-    }
+// Helper to create the correct Storage instance based on config.
+function getStorage(config: Config): Storage {
+  if (config.storage === 'upstash-redis-rest') {
+    return new RedisStorage(
+      config.upstashRedisRestUrl!,
+      config.upstashRedisRestToken!,
+      config.storageHeaderKey!
+    );
   }
-  return result
-}
-let machineId: string | null = null
-function saveMachineId(req: Request): void {
-  if (machineId) return
-  const headerKey = 'fly-replay-src'
-  const raw = req.headers[headerKey.toLowerCase()]
-  if (!raw || typeof raw !== 'string') return
-  try {
-    const parsed = parseFlyReplaySrc(raw)
-    if (parsed.state) {
-      const decoded = decodeURIComponent(parsed.state)
-      const obj = JSON.parse(decoded)
-      if (obj.machineId) machineId = obj.machineId
-    }
-  } catch {
-    // ignore
-  }
+  return new MemoryStorage();
 }
 
 // --------------------------------------------------------------------
-// 8) Main: Start either SSE or stdio server
+// Main: Start the server (SSE or stdio)
 // --------------------------------------------------------------------
 function main(): void {
-  const server = createMcpServer()
+  const argv = yargs(hideBin(process.argv))
+    .option('port', { type: 'number', default: 8000 })
+    .option('transport', { type: 'string', choices: ['sse', 'stdio'], default: 'sse' })
+    .option('storage', {
+      type: 'string',
+      choices: ['memory-single', 'memory', 'upstash-redis-rest'],
+      default: 'memory-single',
+      describe:
+        'Choose storage backend: "memory-single" uses fixed single-user storage; "memory" uses multi-user in-memory storage (requires --storageHeaderKey); "upstash-redis-rest" uses Upstash Redis (requires --storageHeaderKey, --upstashRedisRestUrl, and --upstashRedisRestToken).'
+    })
+    .option('facebookAppId', { type: 'string', demandOption: true, describe: "Facebook App ID" })
+    .option('facebookAppSecret', { type: 'string', demandOption: true, describe: "Facebook App Secret" })
+    .option('facebookRedirectUri', { type: 'string', demandOption: true, describe: "Facebook Redirect URI" })
+    .option('facebookState', { type: 'string', describe: "Optional OAuth state parameter" })
+    .option('storageHeaderKey', { type: 'string', describe: 'For storage "memory" or "upstash-redis-rest": the header name (or key prefix) to use.' })
+    .option('upstashRedisRestUrl', { type: 'string', describe: 'Upstash Redis REST URL (if --storage=upstash-redis-rest)' })
+    .option('upstashRedisRestToken', { type: 'string', describe: 'Upstash Redis REST token (if --storage=upstash-redis-rest)' })
+    .help()
+    .parseSync();
 
-  if (argv.transport === 'stdio') {
-    const transport = new StdioServerTransport()
-    void server.connect(transport)
-    log('Listening on stdio')
-    return
+  const config: Config = {
+    port: argv.port,
+    transport: argv.transport as 'sse' | 'stdio',
+    storage: argv.storage as 'memory-single' | 'memory' | 'upstash-redis-rest',
+    facebookAppId: argv.facebookAppId,
+    facebookAppSecret: argv.facebookAppSecret,
+    facebookRedirectUri: argv.facebookRedirectUri,
+    facebookState: argv.facebookState,
+    storageHeaderKey:
+      (argv.storage === 'memory-single')
+        ? undefined
+        : (argv.storageHeaderKey && argv.storageHeaderKey.trim()
+          ? argv.storageHeaderKey.trim()
+          : (() => { console.error('Error: --storageHeaderKey is required for storage modes "memory" or "upstash-redis-rest".'); process.exit(1); return ''; })()),
+    upstashRedisRestUrl: argv.upstashRedisRestUrl,
+    upstashRedisRestToken: argv.upstashRedisRestToken,
+  };
+
+  if (config.storage === 'upstash-redis-rest') {
+    if (!config.upstashRedisRestUrl || !config.upstashRedisRestUrl.trim()) {
+      console.error("Error: --upstashRedisRestUrl is required for storage mode 'upstash-redis-rest'.");
+      process.exit(1);
+    }
+    if (!config.upstashRedisRestToken || !config.upstashRedisRestToken.trim()) {
+      console.error("Error: --upstashRedisRestToken is required for storage mode 'upstash-redis-rest'.");
+      process.exit(1);
+    }
   }
 
-  const port = argv.port
-  const app = express()
-  let sessions: Array<{ server: McpServer; transport: SSEServerTransport }> = []
+  if (config.transport === 'stdio') {
+    const memoryKey = "single";
+    const server = createMcpServer(memoryKey, config);
+    const transport = new StdioServerTransport();
+    void server.connect(transport);
+    console.log('Listening on stdio');
+    return;
+  }
 
+  const app = express();
+  interface ServerSession {
+    memoryKey: string;
+    server: McpServer;
+    transport: SSEServerTransport;
+    sessionId: string;
+  }
+  let sessions: ServerSession[] = [];
+
+  // Use JSON parser for non-/message routes.
   app.use((req, res, next) => {
-    if (req.path === '/message') return next()
-    express.json()(req, res, next)
-  })
+    if (req.path === '/message') return next();
+    express.json()(req, res, next);
+  });
 
-  app.get('/', async (req: Request, res: Response) => {
-    saveMachineId(req)
-    const transport = new SSEServerTransport('/message', res)
-    const mcpInstance = createMcpServer()
-    await mcpInstance.connect(transport)
-    sessions.push({ server: mcpInstance, transport })
-
-    const sessionId = transport.sessionId
-    log(`[${sessionId}] SSE connection established`)
-
+  app.get('/', async (req: Request, res: ExpressResponse) => {
+    let memoryKey: string;
+    if (config.storage === 'memory-single') {
+      memoryKey = "single";
+    } else {
+      const headerVal = req.headers[config.storageHeaderKey!.toLowerCase()];
+      if (typeof headerVal !== 'string' || !headerVal.trim()) {
+        res.status(400).json({ error: `Missing or invalid "${config.storageHeaderKey}" header` });
+        return;
+      }
+      memoryKey = headerVal.trim();
+    }
+    const server = createMcpServer(memoryKey, config);
+    const transport = new SSEServerTransport('/message', res);
+    await server.connect(transport);
+    const sessionId = transport.sessionId;
+    sessions.push({ memoryKey, server, transport, sessionId });
+    console.log(`[${sessionId}] SSE connected for key: "${memoryKey}"`);
     transport.onclose = () => {
-      log(`[${sessionId}] SSE closed`)
-      sessions = sessions.filter(s => s.transport !== transport)
-    }
+      console.log(`[${sessionId}] SSE connection closed`);
+      sessions = sessions.filter(s => s.transport !== transport);
+    };
     transport.onerror = (err: Error) => {
-      logErr(`[${sessionId}] SSE error:`, err)
-      sessions = sessions.filter(s => s.transport !== transport)
-    }
+      console.error(`[${sessionId}] SSE error:`, err);
+      sessions = sessions.filter(s => s.transport !== transport);
+    };
     req.on('close', () => {
-      log(`[${sessionId}] SSE client disconnected`)
-      sessions = sessions.filter(s => s.transport !== transport)
-    })
-  })
+      console.log(`[${sessionId}] Client disconnected`);
+      sessions = sessions.filter(s => s.transport !== transport);
+    });
+  });
 
-  app.post('/message', async (req: Request, res: Response) => {
-    const sessionId = req.query.sessionId as string
+  app.post('/message', async (req: Request, res: ExpressResponse) => {
+    const sessionId = req.query.sessionId as string;
     if (!sessionId) {
-      logErr('Missing sessionId')
-      res.status(400).send({ error: 'Missing sessionId' })
-      return
+      console.error('Missing sessionId');
+      res.status(400).send({ error: 'Missing sessionId' });
+      return;
     }
-    const target = sessions.find(s => s.transport.sessionId === sessionId)
+    const target = sessions.find(s => s.sessionId === sessionId);
     if (!target) {
-      logErr(`No active session for sessionId=${sessionId}`)
-      res.status(404).send({ error: 'No active session' })
-      return
+      console.error(`No active session for sessionId=${sessionId}`);
+      res.status(404).send({ error: 'No active session' });
+      return;
     }
     try {
-      await target.transport.handlePostMessage(req, res)
+      await target.transport.handlePostMessage(req, res);
     } catch (err: any) {
-      logErr(`[${sessionId}] Error handling /message:`, err)
-      res.status(500).send({ error: 'Internal error' })
+      console.error(`[${sessionId}] Error handling /message:`, err);
+      res.status(500).send({ error: 'Internal error' });
     }
-  })
+  });
 
-  app.listen(port, () => {
-    log(`Listening on port ${port} (${argv.transport})`)
-  })
+  app.listen(config.port, () => {
+    console.log(`Listening on port ${config.port} (${argv.transport})`);
+  });
 }
 
-main()
+main();
