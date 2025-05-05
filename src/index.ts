@@ -285,7 +285,10 @@ function createMcpServer(memoryKey: string, config: Config, toolsPrefix: string)
   server.tool(
     `${toolsPrefix}auth_url`,
     'Return an OAuth URL for Facebook login.',
-    {},
+    {
+      // TODO: MCP SDK bug patch - remove when fixed
+      comment: z.string().optional(),
+    },
     async () => {
       try {
         const authUrl = generateFacebookAuthUrl(config);
@@ -313,7 +316,10 @@ function createMcpServer(memoryKey: string, config: Config, toolsPrefix: string)
   server.tool(
     `${toolsPrefix}list_pages`,
     'List all Pages managed by the authenticated user. Returns each page with its id and name.',
-    {},
+    {
+      // TODO: MCP SDK bug patch - remove when fixed
+      comment: z.string().optional(),
+    },
     async () => {
       try {
         const pages = await listFacebookPages(config, getStorage(config), memoryKey);
