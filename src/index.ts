@@ -284,7 +284,7 @@ function createMcpServer(memoryKey: string, config: Config, toolsPrefix: string)
 
   server.tool(
     `${toolsPrefix}auth_url`,
-    'Return an OAuth URL for Facebook login. Use this URL to grant access with public_profile, pages_show_list, pages_manage_posts, pages_read_engagement, and read_insights scopes.',
+    'Return an OAuth URL for Facebook login.',
     {},
     async () => {
       try {
@@ -312,7 +312,7 @@ function createMcpServer(memoryKey: string, config: Config, toolsPrefix: string)
 
   server.tool(
     `${toolsPrefix}list_pages`,
-    'List all Pages managed by the authenticated user. Returns each page with its id and name. (Also caches page tokens for subsequent calls.)',
+    'List all Pages managed by the authenticated user. Returns each page with its id and name.',
     {},
     async () => {
       try {
