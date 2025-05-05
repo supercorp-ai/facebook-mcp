@@ -74,7 +74,8 @@ function generateFacebookAuthUrl(config: Config): string {
   const params = new URLSearchParams({
     client_id: config.facebookAppId,
     redirect_uri: config.facebookRedirectUri,
-    scope: 'public_profile,pages_show_list,pages_manage_posts,pages_read_engagement,read_insights'
+    // scope: 'public_profile,pages_show_list,pages_manage_posts,pages_read_engagement,read_insights'
+    scope: 'public_profile,pages_show_list,pages_manage_posts,pages_read_engagement'
   });
   if (config.facebookState && config.facebookState.trim()) {
     params.set('state', config.facebookState.trim());
@@ -233,32 +234,33 @@ async function readFacebookPagePosts(
   return data.data;
 }
 
-async function readFacebookPageInsights(
-  args: { pageId: string; metric: string[]; since?: string; until?: string; period?: string[]; config: Config; storage: Storage; memoryKey: string }
-): Promise<any[]> {
-  const { pageId, metric, since, until, period, config, storage, memoryKey } = args;
-  const stored = await storage.get(memoryKey);
-  const pages = stored?.pages;
-  if (!pages || !pages[pageId]) {
-    throw new Error('Page not found or not authorized. Please list pages first.');
-  }
-  const pageAccessToken = pages[pageId];
-  const params = new URLSearchParams({
-    metric: metric.join(','),
-    access_token: pageAccessToken
-  });
-  if (since) params.set("since", since);
-  if (until) params.set("until", until);
-  if (period) params.set("period", period.join(','));
-  const response = await fetch(`https://graph.facebook.com/${pageId}/insights?${params.toString()}`, {
-    method: 'GET'
-  });
-  const data = await response.json();
-  if (!response.ok || data.error) {
-    throw new Error(`Failed to fetch page insights: ${data.error ? data.error.message : 'Unknown error'}`);
-  }
-  return data.data;
-}
+// TODO: reenable when we have the scope
+// async function readFacebookPageInsights(
+//   args: { pageId: string; metric: string[]; since?: string; until?: string; period?: string[]; config: Config; storage: Storage; memoryKey: string }
+// ): Promise<any[]> {
+//   const { pageId, metric, since, until, period, config, storage, memoryKey } = args;
+//   const stored = await storage.get(memoryKey);
+//   const pages = stored?.pages;
+//   if (!pages || !pages[pageId]) {
+//     throw new Error('Page not found or not authorized. Please list pages first.');
+//   }
+//   const pageAccessToken = pages[pageId];
+//   const params = new URLSearchParams({
+//     metric: metric.join(','),
+//     access_token: pageAccessToken
+//   });
+//   if (since) params.set("since", since);
+//   if (until) params.set("until", until);
+//   if (period) params.set("period", period.join(','));
+//   const response = await fetch(`https://graph.facebook.com/${pageId}/insights?${params.toString()}`, {
+//     method: 'GET'
+//   });
+//   const data = await response.json();
+//   if (!response.ok || data.error) {
+//     throw new Error(`Failed to fetch page insights: ${data.error ? data.error.message : 'Unknown error'}`);
+//   }
+//   return data.data;
+// }
 
 // --------------------------------------------------------------------
 // Helper: JSON Response Formatter (repeated)
@@ -350,25 +352,26 @@ function createMcpServer(memoryKey: string, config: Config, toolsPrefix: string)
     }
   );
 
-  server.tool(
-    `${toolsPrefix}read_page_insights`,
-    'Read insights from a specified Facebook Page. Provide pageId, a list of metrics, and optionally since, until (ISO date strings), and a list of period values.',
-    {
-      pageId: z.string(),
-      metric: z.array(z.string()),
-      since: z.string().optional(),
-      until: z.string().optional(),
-      period: z.array(z.string()).optional()
-    },
-    async (args: { pageId: string; metric: string[]; since?: string; until?: string; period?: string[] }) => {
-      try {
-        const insights = await readFacebookPageInsights({ ...args, config, storage: getStorage(config), memoryKey });
-        return toTextJson({ insights });
-      } catch (err: any) {
-        return toTextJson({ error: String(err.message) });
-      }
-    }
-  );
+  // TODO: reenable when we have the scope
+  // server.tool(
+  //   `${toolsPrefix}read_page_insights`,
+  //   'Read insights from a specified Facebook Page. Provide pageId, a list of metrics, and optionally since, until (ISO date strings), and a list of period values.',
+  //   {
+  //     pageId: z.string(),
+  //     metric: z.array(z.string()),
+  //     since: z.string().optional(),
+  //     until: z.string().optional(),
+  //     period: z.array(z.string()).optional()
+  //   },
+  //   async (args: { pageId: string; metric: string[]; since?: string; until?: string; period?: string[] }) => {
+  //     try {
+  //       const insights = await readFacebookPageInsights({ ...args, config, storage: getStorage(config), memoryKey });
+  //       return toTextJson({ insights });
+  //     } catch (err: any) {
+  //       return toTextJson({ error: String(err.message) });
+  //     }
+  //   }
+  // );
 
   return server;
 }
