@@ -6,15 +6,18 @@ import express, { Request, Response as ExpressResponse } from 'express'
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js'
 import { SSEServerTransport } from '@modelcontextprotocol/sdk/server/sse.js'
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js'
+import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js'
+import { InMemoryEventStore } from '@modelcontextprotocol/sdk/examples/shared/inMemoryEventStore.js'
 import { z } from 'zod'
 import { Redis } from '@upstash/redis'
+import { randomUUID } from 'node:crypto'
 
 // --------------------------------------------------------------------
 // Configuration & Storage Interface
 // --------------------------------------------------------------------
 interface Config {
   port: number;
-  transport: 'sse' | 'stdio';
+  transport: 'sse' | 'stdio' | 'http';
   // Storage modes: "memory-single", "memory", or "upstash-redis-rest"
   storage: 'memory-single' | 'memory' | 'upstash-redis-rest';
   facebookAppId: string;
@@ -58,7 +61,7 @@ class RedisStorage implements Storage {
   }
   async get(memoryKey: string): Promise<Record<string, any> | undefined> {
     const data = await this.redis.get(`${this.keyPrefix}:${memoryKey}`);
-    return data === null ? undefined : data;
+    return data === null ? undefined : (typeof data === 'string' ? JSON.parse(data) : data);
   }
   async set(memoryKey: string, data: Record<string, any>) {
     const existing = (await this.get(memoryKey)) || {};
@@ -234,36 +237,8 @@ async function readFacebookPagePosts(
   return data.data;
 }
 
-// TODO: reenable when we have the scope
-// async function readFacebookPageInsights(
-//   args: { pageId: string; metric: string[]; since?: string; until?: string; period?: string[]; config: Config; storage: Storage; memoryKey: string }
-// ): Promise<any[]> {
-//   const { pageId, metric, since, until, period, config, storage, memoryKey } = args;
-//   const stored = await storage.get(memoryKey);
-//   const pages = stored?.pages;
-//   if (!pages || !pages[pageId]) {
-//     throw new Error('Page not found or not authorized. Please list pages first.');
-//   }
-//   const pageAccessToken = pages[pageId];
-//   const params = new URLSearchParams({
-//     metric: metric.join(','),
-//     access_token: pageAccessToken
-//   });
-//   if (since) params.set("since", since);
-//   if (until) params.set("until", until);
-//   if (period) params.set("period", period.join(','));
-//   const response = await fetch(`https://graph.facebook.com/${pageId}/insights?${params.toString()}`, {
-//     method: 'GET'
-//   });
-//   const data = await response.json();
-//   if (!response.ok || data.error) {
-//     throw new Error(`Failed to fetch page insights: ${data.error ? data.error.message : 'Unknown error'}`);
-//   }
-//   return data.data;
-// }
-
 // --------------------------------------------------------------------
-// Helper: JSON Response Formatter (repeated)
+// Helper: JSON Response Formatter
 // --------------------------------------------------------------------
 function toTextJson(data: unknown): { content: Array<{ type: 'text'; text: string }> } {
   return {
@@ -358,27 +333,6 @@ function createMcpServer(memoryKey: string, config: Config, toolsPrefix: string)
     }
   );
 
-  // TODO: reenable when we have the scope
-  // server.tool(
-  //   `${toolsPrefix}read_page_insights`,
-  //   'Read insights from a specified Facebook Page. Provide pageId, a list of metrics, and optionally since, until (ISO date strings), and a list of period values.',
-  //   {
-  //     pageId: z.string(),
-  //     metric: z.array(z.string()),
-  //     since: z.string().optional(),
-  //     until: z.string().optional(),
-  //     period: z.array(z.string()).optional()
-  //   },
-  //   async (args: { pageId: string; metric: string[]; since?: string; until?: string; period?: string[] }) => {
-  //     try {
-  //       const insights = await readFacebookPageInsights({ ...args, config, storage: getStorage(config), memoryKey });
-  //       return toTextJson({ insights });
-  //     } catch (err: any) {
-  //       return toTextJson({ error: String(err.message) });
-  //     }
-  //   }
-  // );
-
   return server;
 }
 
@@ -390,17 +344,18 @@ function getStorage(config: Config): Storage {
       config.upstashRedisRestToken!,
       config.storageHeaderKey!
     );
+    // Note: storageHeaderKey is used as the key prefix for Upstash
   }
   return new MemoryStorage();
 }
 
 // --------------------------------------------------------------------
-// Main: Start the server (SSE or stdio) with CLI validations
+// Main: Start the server (HTTP / SSE / stdio) with CLI validations
 // --------------------------------------------------------------------
 async function main() {
   const argv = yargs(hideBin(process.argv))
     .option('port', { type: 'number', default: 8000 })
-    .option('transport', { type: 'string', choices: ['sse', 'stdio'], default: 'sse' })
+    .option('transport', { type: 'string', choices: ['sse', 'stdio', 'http'], default: 'sse' })
     .option('storage', {
       type: 'string',
       choices: ['memory-single', 'memory', 'upstash-redis-rest'],
@@ -421,7 +376,7 @@ async function main() {
 
   const config: Config = {
     port: argv.port,
-    transport: argv.transport as 'sse' | 'stdio',
+    transport: argv.transport as 'sse' | 'stdio' | 'http',
     storage: argv.storage as 'memory-single' | 'memory' | 'upstash-redis-rest',
     facebookAppId: argv.facebookAppId,
     facebookAppSecret: argv.facebookAppSecret,
@@ -450,15 +405,163 @@ async function main() {
 
   const toolsPrefix: string = argv.toolsPrefix;
 
+  // stdio
   if (config.transport === 'stdio') {
     const memoryKey = "single";
     const server = createMcpServer(memoryKey, config, toolsPrefix);
     const transport = new StdioServerTransport();
-    void server.connect(transport);
+    await server.connect(transport);
     console.log('Listening on stdio');
     return;
   }
 
+  // Streamable HTTP (root "/")
+  if (config.transport === 'http') {
+    const app = express();
+
+    // Do not JSON-parse "/" — the transport handles raw body/streaming
+    app.use((req, res, next) => {
+      if (req.path === '/') return next();
+      express.json()(req, res, next);
+    });
+
+    interface HttpSession {
+      memoryKey: string;
+      server: McpServer;
+      transport: StreamableHTTPServerTransport;
+    }
+    const sessions = new Map<string, HttpSession>();
+
+    function resolveMemoryKeyFromHeaders(req: Request): string | undefined {
+      if (config.storage === 'memory-single') return 'single';
+      const keyName = (config.storageHeaderKey as string).toLowerCase();
+      const headerVal = req.headers[keyName];
+      if (typeof headerVal !== 'string' || !headerVal.trim()) return undefined;
+      return headerVal.trim();
+    }
+
+    function createServerFor(memoryKey: string) {
+      return createMcpServer(memoryKey, config, toolsPrefix);
+    }
+
+    // POST / — JSON-RPC input; initializes a session if none exists
+    app.post('/', async (req: Request, res: ExpressResponse) => {
+      try {
+        const sessionId = req.headers['mcp-session-id'] as string | undefined;
+
+        if (sessionId && sessions.has(sessionId)) {
+          const { transport } = sessions.get(sessionId)!;
+          await transport.handleRequest(req, res);
+          return;
+        }
+
+        // New initialization — require a valid memoryKey (no anonymous)
+        const memoryKey = resolveMemoryKeyFromHeaders(req);
+        if (!memoryKey) {
+          res.status(400).json({
+            jsonrpc: '2.0',
+            error: { code: -32000, message: `Bad Request: Missing or invalid "${config.storageHeaderKey}" header` },
+            id: (req as any)?.body?.id
+          });
+          return;
+        }
+
+        const server = createServerFor(memoryKey);
+        const eventStore = new InMemoryEventStore();
+
+        let transport!: StreamableHTTPServerTransport;
+        transport = new StreamableHTTPServerTransport({
+          sessionIdGenerator: () => randomUUID(),
+          eventStore,
+          onsessioninitialized: (newSessionId: string) => {
+            sessions.set(newSessionId, { memoryKey, server, transport });
+            console.log(`[${newSessionId}] HTTP session initialized for key "${memoryKey}"`);
+          }
+        });
+
+        transport.onclose = async () => {
+          const sid = transport.sessionId;
+          if (sid && sessions.has(sid)) {
+            sessions.delete(sid);
+            console.log(`[${sid}] Transport closed; removed session`);
+          }
+          try { await server.close(); } catch { /* already closed */ }
+        };
+
+        await server.connect(transport);
+        await transport.handleRequest(req, res);
+      } catch (err) {
+        console.error('Error handling HTTP POST /:', err);
+        if (!res.headersSent) {
+          res.status(500).json({
+            jsonrpc: '2.0',
+            error: { code: -32603, message: 'Internal server error' },
+            id: (req as any)?.body?.id
+          });
+        }
+      }
+    });
+
+    // GET / — server->client event stream (SSE under the hood)
+    app.get('/', async (req: Request, res: ExpressResponse) => {
+      const sessionId = req.headers['mcp-session-id'] as string | undefined;
+      if (!sessionId || !sessions.has(sessionId)) {
+        res.status(400).json({
+          jsonrpc: '2.0',
+          error: { code: -32000, message: 'Bad Request: No valid session ID provided' },
+          id: (req as any)?.body?.id
+        });
+        return;
+      }
+      try {
+        const { transport } = sessions.get(sessionId)!;
+        await transport.handleRequest(req, res);
+      } catch (err) {
+        console.error(`[${sessionId}] Error handling HTTP GET /:`, err);
+        if (!res.headersSent) {
+          res.status(500).json({
+            jsonrpc: '2.0',
+            error: { code: -32603, message: 'Internal server error' },
+            id: (req as any)?.body?.id
+          });
+        }
+      }
+    });
+
+    // DELETE / — session termination
+    app.delete('/', async (req: Request, res: ExpressResponse) => {
+      const sessionId = req.headers['mcp-session-id'] as string | undefined;
+      if (!sessionId || !sessions.has(sessionId)) {
+        res.status(400).json({
+          jsonrpc: '2.0',
+          error: { code: -32000, message: 'Bad Request: No valid session ID provided' },
+          id: (req as any)?.body?.id
+        });
+        return;
+      }
+      try {
+        const { transport } = sessions.get(sessionId)!;
+        await transport.handleRequest(req, res);
+      } catch (err) {
+        console.error(`[${sessionId}] Error handling HTTP DELETE /:`, err);
+        if (!res.headersSent) {
+          res.status(500).json({
+            jsonrpc: '2.0',
+            error: { code: -32603, message: 'Error handling session termination' },
+            id: (req as any)?.body?.id
+          });
+        }
+      }
+    });
+
+    app.listen(config.port, () => {
+      console.log(`Listening on port ${config.port} (http) [storage=${config.storage}]`);
+    });
+
+    return; // do not fall through to SSE
+  }
+
+  // SSE
   const app = express();
   interface ServerSession {
     memoryKey: string;
@@ -527,7 +630,7 @@ async function main() {
   });
 
   app.listen(argv.port, () => {
-    console.log(`Listening on port ${argv.port} (${argv.transport})`);
+    console.log(`Listening on port ${argv.port} (sse) [storage=${config.storage}]`);
   });
 }
 
