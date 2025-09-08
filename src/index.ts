@@ -86,6 +86,150 @@ function generateFacebookAuthUrl(config: Config): string {
   return `https://www.facebook.com/v12.0/dialog/oauth?${params.toString()}`;
 }
 
+// Exchange a short-lived user access token for a long-lived user token (~60 days)
+async function exchangeToLongLivedUserToken(
+  shortLivedToken: string,
+  config: Config
+): Promise<{ access_token: string; token_type?: string; expires_in?: number }> {
+  const params = new URLSearchParams({
+    grant_type: 'fb_exchange_token',
+    client_id: config.facebookAppId,
+    client_secret: config.facebookAppSecret,
+    fb_exchange_token: shortLivedToken,
+  });
+  const resp = await fetch(`https://graph.facebook.com/v12.0/oauth/access_token?${params.toString()}`, {
+    method: 'GET',
+  });
+  const data = await resp.json();
+  if (!resp.ok || !data.access_token) {
+    const msg = data?.error?.message || 'Failed to exchange for long-lived token';
+    throw new Error(msg);
+  }
+  return data;
+}
+
+// Inspect token metadata using Graph API debug_token
+type TokenDebug = { expires_at?: number; data_access_expires_at?: number; is_valid?: boolean; type?: string; issued_at?: number; user_id?: string };
+async function debugFacebookToken(token: string, config: Config): Promise<TokenDebug | undefined> {
+  const appAccessToken = `${config.facebookAppId}|${config.facebookAppSecret}`;
+  const params = new URLSearchParams({ input_token: token, access_token: appAccessToken });
+  const versions = ['v12.0', 'v17.0'];
+  for (const ver of versions) {
+    try {
+      const url = `https://graph.facebook.com/${ver}/debug_token?${params.toString()}`;
+      const resp = await fetch(url, { method: 'GET' });
+      const info = await resp.json();
+      if (!resp.ok || !info?.data) {
+        console.warn(`[facebook-mcp] debug_token (${ver}) failed or missing data:`, info?.error || info);
+        continue;
+      }
+      const data = info.data as TokenDebug;
+      console.log(`[facebook-mcp] debug_token ${ver}: is_valid=${data?.is_valid} type=${data?.type} user_id=${data?.user_id} expires_at=${data?.expires_at ?? 'n/a'} data_access_expires_at=${data?.data_access_expires_at ?? 'n/a'}`);
+      return data;
+    } catch (e) {
+      console.warn(`[facebook-mcp] debug_token (${ver}) error:`, e);
+    }
+  }
+  return undefined;
+}
+
+// Ensure we have a long-lived user token stored at key `accessToken`.
+// Backward-compatible: if no expires info exists, attempt upgrade in-place.
+async function ensureLongLivedUserToken(
+  storage: Storage,
+  memoryKey: string,
+  config: Config
+): Promise<string> {
+  const stored = await storage.get(memoryKey);
+  if (!stored || !stored.accessToken) {
+    throw new Error('No Facebook access token available.');
+  }
+
+  // Sanitize and persist token if needed
+  const sanitized = sanitizeToken(stored.accessToken);
+  if (sanitized !== stored.accessToken) {
+    await storage.set(memoryKey, { accessToken: sanitized });
+    console.log('[facebook-mcp] Sanitized accessToken (removed trailing fragments).');
+  }
+
+  const now = Date.now();
+  const expiresAt: number | undefined = stored.accessTokenExpiresAt;
+
+  if (!expiresAt) {
+    console.log('[facebook-mcp] accessToken has no expiresAt; attempting to determine/upgrade.');
+  }
+
+  // If we already have a future expiry, consider it long-lived; extend if close to expiry (<7 days)
+  if (expiresAt && expiresAt > now) {
+    const sevenDays = 7 * 24 * 60 * 60 * 1000;
+    if (expiresAt - now < sevenDays) {
+      try {
+        console.log('[facebook-mcp] accessToken near expiry; extending via fb_exchange_token.');
+        const exchanged = await exchangeToLongLivedUserToken(sanitized, config);
+        const newExpiresAt = exchanged.expires_in ? now + exchanged.expires_in * 1000 : undefined;
+        await storage.set(memoryKey, {
+          accessToken: exchanged.access_token,
+          accessTokenType: exchanged.token_type || stored.accessTokenType,
+          accessTokenExpiresAt: newExpiresAt,
+        });
+        if (!newExpiresAt) {
+          // Attempt to fetch expires_at via debug_token as fallback
+          const meta = await debugFacebookToken(exchanged.access_token, config);
+          if (meta?.expires_at) {
+            await storage.set(memoryKey, { accessTokenExpiresAt: meta.expires_at * 1000 });
+            console.log('[facebook-mcp] Updated accessTokenExpiresAt from debug_token after extension.');
+          }
+        }
+        return exchanged.access_token;
+      } catch (e) {
+        // If extend fails, fall back to existing token (may still be valid until expiresAt)
+        console.warn('[facebook-mcp] fb_exchange_token failed near expiry; using existing token.', e);
+        return stored.accessToken;
+      }
+    }
+    return stored.accessToken;
+  }
+
+  // Legacy or short-lived without expiry: attempt an upgrade.
+  try {
+    console.log('[facebook-mcp] Upgrading accessToken to long-lived via fb_exchange_token.');
+    const exchanged = await exchangeToLongLivedUserToken(sanitized, config);
+    const newExpiresAt = exchanged.expires_in ? now + exchanged.expires_in * 1000 : undefined;
+    await storage.set(memoryKey, {
+      accessToken: exchanged.access_token,
+      accessTokenType: exchanged.token_type,
+      accessTokenExpiresAt: newExpiresAt,
+      // keep any other stored fields intact via Storage.set implementation
+    });
+    if (!newExpiresAt) {
+      // Fallback: query debug_token to persist expiry if available
+      const meta = await debugFacebookToken(exchanged.access_token, config);
+      if (meta?.expires_at) {
+        await storage.set(memoryKey, { accessTokenExpiresAt: meta.expires_at * 1000 });
+        console.log('[facebook-mcp] Stored accessTokenExpiresAt from debug_token after upgrade.');
+      } else if (typeof meta?.data_access_expires_at === 'number') {
+        await storage.set(memoryKey, { accessTokenDataAccessExpiresAt: meta.data_access_expires_at * 1000 });
+        console.log('[facebook-mcp] Stored accessTokenDataAccessExpiresAt from debug_token after upgrade.');
+      } else {
+        console.log('[facebook-mcp] Long-lived token obtained but expires_in not provided by API.');
+      }
+    }
+    return exchanged.access_token;
+  } catch (e) {
+    // If exchange fails (e.g., token already long-lived or invalid), keep original to preserve compatibility
+    console.warn('[facebook-mcp] fb_exchange_token upgrade failed; attempting to fetch expiry via debug_token.', e);
+    const meta = await debugFacebookToken(sanitized, config);
+    if (meta?.expires_at) {
+      await storage.set(memoryKey, { accessTokenExpiresAt: meta.expires_at * 1000 });
+      console.log('[facebook-mcp] Stored accessTokenExpiresAt from debug_token (original token).');
+    } else if (typeof meta?.data_access_expires_at === 'number') {
+      await storage.set(memoryKey, { accessTokenDataAccessExpiresAt: meta.data_access_expires_at * 1000 });
+      console.log('[facebook-mcp] Stored accessTokenDataAccessExpiresAt from debug_token (original token).');
+    }
+    return stored.accessToken;
+  }
+}
+
 async function exchangeFacebookAuthCode(
   code: string,
   config: Config,
@@ -105,8 +249,48 @@ async function exchangeFacebookAuthCode(
   if (!data.access_token) {
     throw new Error('Failed to obtain Facebook access token.');
   }
-  await storage.set(memoryKey, { accessToken: data.access_token });
-  return data.access_token;
+  // Immediately upgrade to a long-lived user access token for durability
+  let finalAccessToken = data.access_token as string;
+  try {
+    console.log('[facebook-mcp] Exchanging short-lived user token for long-lived token.');
+    const exchanged = await exchangeToLongLivedUserToken(data.access_token, config);
+    finalAccessToken = sanitizeToken(exchanged.access_token);
+    const now = Date.now();
+    const newExpiresAt = exchanged.expires_in ? now + exchanged.expires_in * 1000 : undefined;
+    await storage.set(memoryKey, {
+      accessToken: finalAccessToken,
+      accessTokenType: exchanged.token_type,
+      accessTokenExpiresAt: newExpiresAt,
+    });
+    if (!newExpiresAt) {
+      const meta = await debugFacebookToken(finalAccessToken, config);
+      if (meta?.expires_at) {
+        await storage.set(memoryKey, { accessTokenExpiresAt: meta.expires_at * 1000 });
+        console.log('[facebook-mcp] Stored accessTokenExpiresAt from debug_token after initial exchange.');
+      } else if (typeof meta?.data_access_expires_at === 'number') {
+        await storage.set(memoryKey, { accessTokenDataAccessExpiresAt: meta.data_access_expires_at * 1000 });
+        console.log('[facebook-mcp] Stored accessTokenDataAccessExpiresAt from debug_token (no token expiry reported).');
+      } else {
+        console.log('[facebook-mcp] Exchange succeeded, but API did not include expires_in; no expiry saved.');
+      }
+    } else {
+      console.log('[facebook-mcp] Stored long-lived token with expires_in seconds =', exchanged.expires_in);
+    }
+  } catch {
+    // If exchange fails, store short-lived token (backward compatible)
+    console.warn('[facebook-mcp] Long-lived exchange failed; storing short-lived token.');
+    await storage.set(memoryKey, { accessToken: finalAccessToken });
+    // Try to fetch expiry metadata anyway
+    const meta = await debugFacebookToken(finalAccessToken, config);
+    if (meta?.expires_at) {
+      await storage.set(memoryKey, { accessTokenExpiresAt: meta.expires_at * 1000 });
+      console.log('[facebook-mcp] Stored accessTokenExpiresAt from debug_token (short-lived).');
+    } else if (typeof meta?.data_access_expires_at === 'number') {
+      await storage.set(memoryKey, { accessTokenDataAccessExpiresAt: meta.data_access_expires_at * 1000 });
+      console.log('[facebook-mcp] Stored accessTokenDataAccessExpiresAt from debug_token (short-lived).');
+    }
+  }
+  return finalAccessToken;
 }
 
 async function fetchFacebookUser(
@@ -114,13 +298,11 @@ async function fetchFacebookUser(
   storage: Storage,
   memoryKey: string
 ): Promise<{ id: string; name: string }> {
-  const stored = await storage.get(memoryKey);
-  if (!stored || !stored.accessToken) {
-    throw new Error('No Facebook access token available.');
-  }
-  const response = await fetch(`https://graph.facebook.com/me?fields=id,name&access_token=${stored.accessToken}`, {
-    method: 'GET'
-  });
+  // Ensure we use a long-lived user token; auto-upgrade legacy short tokens.
+  const accessToken = await ensureLongLivedUserToken(storage, memoryKey, config);
+  const url = new URL('https://graph.facebook.com/me');
+  url.search = new URLSearchParams({ fields: 'id,name', access_token: accessToken }).toString();
+  const response = await fetch(url, { method: 'GET' });
   const data = await response.json();
   if (!data.id) {
     throw new Error('Failed to fetch Facebook user id.');
@@ -152,13 +334,11 @@ async function listFacebookPages(
   storage: Storage,
   memoryKey: string
 ): Promise<FacebookPage[]> {
-  const stored = await storage.get(memoryKey);
-  if (!stored || !stored.accessToken) {
-    throw new Error('No Facebook access token available.');
-  }
-  const response = await fetch(`https://graph.facebook.com/me/accounts?access_token=${stored.accessToken}`, {
-    method: 'GET'
-  });
+  const accessToken = await ensureLongLivedUserToken(storage, memoryKey, config);
+  console.log('[facebook-mcp] Fetching /me/accounts to refresh Page tokens.');
+  const url = new URL('https://graph.facebook.com/me/accounts');
+  url.search = new URLSearchParams({ access_token: accessToken }).toString();
+  const response = await fetch(url, { method: 'GET' });
   const data = await response.json();
   if (!response.ok || data.error) {
     throw new Error(`Failed to fetch pages: ${data.error ? data.error.message : 'Unknown error'}`);
@@ -168,7 +348,30 @@ async function listFacebookPages(
     pages[page.id] = page.access_token;
   }
   await storage.set(memoryKey, { pages });
+  console.log(`[facebook-mcp] Cached ${data.data?.length ?? 0} Page tokens.`);
   return data.data;
+}
+
+// Reusable helper to obtain a Page access token. If not cached, refreshes pages once.
+async function getPageAccessTokenFor(
+  pageId: string,
+  config: Config,
+  storage: Storage,
+  memoryKey: string
+): Promise<string> {
+  let stored = await storage.get(memoryKey);
+  let pages = stored?.pages as { [key: string]: string } | undefined;
+  if (!pages || !pages[pageId]) {
+    console.log(`[facebook-mcp] No cached Page token for ${pageId}; refreshing …`);
+    await listFacebookPages(config, storage, memoryKey);
+    stored = await storage.get(memoryKey);
+    pages = stored?.pages as { [key: string]: string } | undefined;
+  }
+  const token = pages?.[pageId];
+  if (!token || !String(token).trim()) {
+    throw new Error('Page not found or not authorized. Please list pages first.');
+  }
+  return token;
 }
 
 /**
@@ -179,12 +382,7 @@ async function createFacebookPagePost(
   args: { pageId: string; postContent: string; imageUrl?: string; config: Config; storage: Storage; memoryKey: string }
 ): Promise<{ success: boolean; message: string; postId: string }> {
   const { pageId, postContent, imageUrl, config, storage, memoryKey } = args;
-  const stored = await storage.get(memoryKey);
-  const pages = stored?.pages;
-  if (!pages || !pages[pageId]) {
-    throw new Error('Page not found or not authorized. Please list pages first.');
-  }
-  const pageAccessToken = pages[pageId];
+  let pageAccessToken = await getPageAccessTokenFor(pageId, config, storage, memoryKey);
   let url: string;
   let params: URLSearchParams;
 
@@ -212,6 +410,24 @@ async function createFacebookPagePost(
   });
   const data = await response.json();
   if (!response.ok || data.error) {
+    // If token invalid/expired, refresh page tokens once and retry
+    if (isLikelyTokenError(data)) {
+      console.warn('[facebook-mcp] Token error posting to Page; refreshing Page token and retrying once.');
+      try {
+        pageAccessToken = await getPageAccessTokenFor(pageId, config, storage, memoryKey);
+        params.set('access_token', pageAccessToken);
+        const retryResp = await fetch(url, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+          body: params.toString(),
+        });
+        const retryData = await retryResp.json();
+        if (retryResp.ok && !retryData.error) {
+          console.log('[facebook-mcp] Retry succeeded for Page post.');
+          return { success: true, message: 'Post created successfully.', postId: retryData.id };
+        }
+      } catch {}
+    }
     throw new Error(`Facebook page post creation failed: ${data.error ? data.error.message : 'Unknown error'}`);
   }
   return { success: true, message: 'Post created successfully.', postId: data.id };
@@ -221,17 +437,26 @@ async function readFacebookPagePosts(
   args: { pageId: string; config: Config; storage: Storage; memoryKey: string }
 ): Promise<any[]> {
   const { pageId, config, storage, memoryKey } = args;
-  const stored = await storage.get(memoryKey);
-  const pages = stored?.pages;
-  if (!pages || !pages[pageId]) {
-    throw new Error('Page not found or not authorized. Please list pages first.');
-  }
-  const pageAccessToken = pages[pageId];
-  const response = await fetch(`https://graph.facebook.com/${pageId}/posts?access_token=${pageAccessToken}`, {
-    method: 'GET'
-  });
+  const pageAccessToken = await getPageAccessTokenFor(pageId, config, storage, memoryKey);
+  const url = new URL(`https://graph.facebook.com/${pageId}/posts`);
+  url.search = new URLSearchParams({ access_token: pageAccessToken }).toString();
+  const response = await fetch(url, { method: 'GET' });
   const data = await response.json();
   if (!response.ok || data.error) {
+    if (isLikelyTokenError(data)) {
+      console.warn('[facebook-mcp] Token error reading Page posts; refreshing Page token and retrying once.');
+      try {
+        const refreshedToken = await getPageAccessTokenFor(pageId, config, storage, memoryKey);
+        const retryUrl = new URL(`https://graph.facebook.com/${pageId}/posts`);
+        retryUrl.search = new URLSearchParams({ access_token: refreshedToken }).toString();
+        const retryResp = await fetch(retryUrl, { method: 'GET' });
+        const retryData = await retryResp.json();
+        if (retryResp.ok && !retryData.error) {
+          console.log('[facebook-mcp] Retry succeeded for Page posts read.');
+          return retryData.data;
+        }
+      } catch {}
+    }
     throw new Error(`Failed to fetch page posts: ${data.error ? data.error.message : 'Unknown error'}`);
   }
   return data.data;
@@ -247,6 +472,22 @@ function toTextJson(data: unknown): { content: Array<{ type: 'text'; text: strin
     ]
   };
 }
+
+// Helper: detect token-related errors from Facebook Graph API responses
+function isLikelyTokenError(data: any): boolean {
+  const err = data?.error;
+  if (!err) return false;
+  const msg: string = (err?.message ?? '').toString();
+  const code: number | undefined = typeof err?.code === 'number' ? err.code : undefined;
+  const subcode: number | undefined = typeof err?.error_subcode === 'number' ? err.error_subcode : undefined;
+  return msg.includes('Invalid OAuth access token') || code === 190 || typeof subcode === 'number';
+}
+
+// Helper: sanitize token values copied from URLs (e.g., trailing "#_=_")
+function sanitizeToken(token: string): string {
+  return token.trim().replace(/#_=_$/, '');
+}
+
 
 // --------------------------------------------------------------------
 // Create an MCP server and register Facebook tools with toolsPrefix support
@@ -332,6 +573,7 @@ function createMcpServer(memoryKey: string, config: Config, toolsPrefix: string)
       }
     }
   );
+
 
   return server;
 }
