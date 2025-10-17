@@ -665,7 +665,8 @@ async function main() {
       res.set({
         'Access-Control-Allow-Origin': '*',
         'Access-Control-Allow-Headers': '*',
-        'Access-Control-Allow-Methods': 'GET,POST,DELETE,OPTIONS,HEAD'
+        'Access-Control-Allow-Methods': 'GET,POST,DELETE,OPTIONS,HEAD',
+        'Access-Control-Expose-Headers': 'MCP-Session-Id'
       });
       next();
     });
@@ -841,7 +842,8 @@ async function main() {
     res.set({
       'Access-Control-Allow-Origin': '*',
       'Access-Control-Allow-Headers': '*',
-      'Access-Control-Allow-Methods': 'GET,POST,OPTIONS,HEAD'
+      'Access-Control-Allow-Methods': 'GET,POST,OPTIONS,HEAD',
+      'Access-Control-Expose-Headers': 'MCP-Session-Id'
     });
     next();
   });
